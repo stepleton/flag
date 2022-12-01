@@ -21,12 +21,12 @@
 --   graphics.not.text: True to enter a graphics mode; false for 80-col text
 --   five.not.four: For graphics -- true for CGA mode 5; false for mode 4
 --   intense.not.dim: For graphics -- true for intense colours; false for dim
---   trans.not.panafrican: For graphics -- true for cyan/magenta/white
---       colours; false for red/yellow/green
+--   cmw.not.ryg: For graphics -- true for cyan/magenta/white colours; false
+--       for red/yellow/green
 --   result: msdos.lib result byte; spr.ok from hostio.lib means success
 PROC CgaVideoMode (CHAN OF SP fs, ts,
                    VAL BOOL graphics.not.text, five.not.four,
-                   VAL BOOL intense.not.dim, trans.not.panafrican,
+                   VAL BOOL intense.not.dim, cmw.not.ryg,
                    BYTE result)
 
   #USE "msdos.lib"
@@ -56,7 +56,7 @@ PROC CgaVideoMode (CHAN OF SP fs, ts,
             result = spr.ok
               SEQ
                 colour.control := BYTE (((INT intense.not.dim) << 4) \/
-                                        ((INT trans.not.panafrican) << 5))
+                                        ((INT cmw.not.ryg) << 5))
                 dos.port.write (fs, ts, #03D9(INT16), colour.control, result)
       -- }}}
       NOT graphics.not.text  -- {{{Return to 80-column text mode.

@@ -146,7 +146,7 @@ kB008Base       equ   0150h   ; Transputer B008 board base address
     ; Notes:
     ;   not applicable
 main:
-    xor   bl,bl           ; Select the first flag video mode: "trans" palette
+    xor   bl,bl           ; Select the first flag video mode: "c/m/w" palette
 .m0 ByteToX               ; Send palette choice to B008; also synchronise start
     call  FlagVideoMode   ; Enter the selected video mode now
 

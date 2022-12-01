@@ -171,26 +171,26 @@ PROC FlagFillColourMap (VAL INT flag.type, rows, columns, []BYTE colour.map)
 BOOL, BOOL, BOOL FUNCTION FlagCgaVideoModeOptions (VAL INT flag.type)
   VAL kModeFiveMask IS #4 :
   VAL kIntenseMask IS #2 :
-  VAL kTransMask IS #1 :
+  VAL kCmwMask IS #1 :
   VAL []BYTE kOptionTable IS
-      [BYTE (kIntenseMask \/ kTransMask),     -- kFlagTrans
-       BYTE (kIntenseMask \/ kTransMask),     -- kFlagBotswana
-       BYTE (kIntenseMask \/ kTransMask),     -- kFlagEstonia
+      [BYTE (kIntenseMask \/ kCmwMask),       -- kFlagTrans
+       BYTE (kIntenseMask \/ kCmwMask),       -- kFlagBotswana
+       BYTE (kIntenseMask \/ kCmwMask),       -- kFlagEstonia
        BYTE (kModeFiveMask \/ kIntenseMask),  -- kFlagLuxembourg
        BYTE kIntenseMask,                     -- kFlagBenin
        BYTE kIntenseMask,                     -- kFlagMali
        BYTE (kModeFiveMask \/ kIntenseMask),  -- kFlagFrance
        BYTE (kModeFiveMask \/ kIntenseMask),  -- kFlagPeru
        BYTE (kModeFiveMask \/ kIntenseMask),  -- kFlagUk
-       BYTE (kIntenseMask \/ kTransMask)] :   -- kFlagChequered
+       BYTE (kIntenseMask \/ kCmwMask)] :     -- kFlagChequered
   VAL options IS INT kOptionTable[flag.type] :
-  BOOL five.not.four, intense.not.dim, trans.not.panafrican :
+  BOOL five.not.four, intense.not.dim, cmw.not.ryg :
   VALOF
     PAR
       five.not.four := (options /\ kModeFiveMask) > 0
       intense.not.dim := (options /\ kIntenseMask) > 0
-      trans.not.panafrican := (options /\ kTransMask) > 0
-    RESULT five.not.four, intense.not.dim, trans.not.panafrican
+      cmw.not.ryg := (options /\ kCmwMask) > 0
+    RESULT five.not.four, intense.not.dim, cmw.not.ryg
 :
 -- }}}
 
@@ -206,9 +206,9 @@ PROC FlagCgaVideoMode (CHAN OF SP fs, ts, VAL INT flag.type, BYTE result)
 
   #USE "cga"
 
-  BOOL five.etc, intense.etc, trans.etc :
+  BOOL five.etc, intense.etc, cmw.etc :
   SEQ
-    five.etc, intense.etc, trans.etc := FlagCgaVideoModeOptions (flag.type)
-    CgaVideoMode (fs, ts, TRUE, five.etc, intense.etc, trans.etc, result)
+    five.etc, intense.etc, cmw.etc := FlagCgaVideoModeOptions (flag.type)
+    CgaVideoMode (fs, ts, TRUE, five.etc, intense.etc, cmw.etc, result)
 :
 -- }}}
