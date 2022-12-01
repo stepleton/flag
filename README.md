@@ -460,8 +460,8 @@ generally well-thought-out language:
   other lists.)
 
 * Like Python, occam uses indentation to organise nested blocks of code.
-  Variables and abbreviations (like constants and aliases) scoped to a block
-  are declared immediately above the block.
+  Variables and abbreviations (that is, things like constants and aliases)
+  scoped to a block are declared immediately above the block.
 
 * In occam, reserved words like `IF` and `FOR` and `INT` etc. are written in
   all uppercase letters. The language is case-sensitive.
