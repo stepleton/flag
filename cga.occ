@@ -1,0 +1,127 @@
+-- Transputer/occam flag simulation -- procedures for CGA graphical display
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+--
+-- Routines in this unit make use of the MS-DOS host file server library
+-- (msdos.lib) to call interrupts, write to I/O ports, and push data into CGA
+-- video memory. This is functional, but it might not be as fast as a dedicated
+-- CGA frontend like flagdos.asm.
+
+
+-- {{{***** Includes *****
+#INCLUDE "hostio.inc"
+#INCLUDE "msdos.inc"
+-- }}}
+
+
+-- {{{CgaVideoMode -- Enter and configure, or leave, a CGA video mode
+--
+-- Args:
+--   fs, ts: hostio channels
+--   graphics.not.text: True to enter a graphics mode; false for 80-col text
+--   five.not.four: For graphics -- true for CGA mode 5; false for mode 4
+--   intense.not.dim: For graphics -- true for intense colours; false for dim
+--   trans.not.panafrican: For graphics -- true for cyan/magenta/white
+--       colours; false for red/yellow/green
+--   result: msdos.lib result byte; spr.ok from hostio.lib means success
+PROC CgaVideoMode (CHAN OF SP fs, ts,
+                   VAL BOOL graphics.not.text, five.not.four,
+                   VAL BOOL intense.not.dim, trans.not.panafrican,
+                   BYTE result)
+
+  #USE "msdos.lib"
+
+  BYTE carry.flag :
+  [dos.interrupt.regs.size]BYTE register.block.in, register.block.out :
+  SEQ
+    SKIP
+    -- Zero out registers used as input to dos.call.interrupt
+    PAR i = 0 FOR dos.interrupt.regs.size
+      register.block.in[i] := 0(BYTE)
+
+    -- Prepare to call an interrupt to enter a video mode, then (for graphics)
+    -- set up the desired palette and colour intensity.
+    IF
+      graphics.not.text  -- {{{Enter and set up a CGA graphics mode
+        BYTE colour.control :
+        SEQ
+          -- First, call INT 00h to enter either graphics mode 04h or 05h.
+          register.block.in[0] := BYTE (#04 + (INT five.not.four))
+          dos.call.interrupt (fs, ts, #0010(INT16), register.block.in,
+                              carry.flag, register.block.out, result)
+          -- Now set the colour control register for palette and intensity.
+          IF
+            result <> spr.ok  -- Do nothing if the last call failed.
+              SKIP
+            result = spr.ok
+              SEQ
+                colour.control := BYTE (((INT intense.not.dim) << 4) \/
+                                        ((INT trans.not.panafrican) << 5))
+                dos.port.write (fs, ts, #03D9(INT16), colour.control, result)
+      -- }}}
+      NOT graphics.not.text  -- {{{Return to 80-column text mode.
+        SEQ
+          register.block.in[0] := #03(BYTE)  -- Colour text mode.
+          dos.call.interrupt (fs, ts, #0010(INT16), register.block.in,
+                              carry.flag, register.block.out, result)
+      -- }}}
+:
+-- }}}
+
+
+-- {{{CgaDisplayFrame -- Display an interleaved CGA video frame on the screen
+--
+-- Args:
+--   fs, ts: hostio channels
+--   frame: An 80x200-byte array whose first 8000 bytes holds the even rows
+--       of the frame data that should be placed into CGA video memory and
+--       whose second 8000 bytes holds the odd rows of same. Meant for 320x200
+--       video modes 4 and 5, but will obediently copy data into CGA video RAM
+--       no matter what mode we're in
+--   result: msdos.lib result byte; spr.ok from hostio.lib means success
+PROC CgaDisplayFrame (CHAN OF SP fs, ts, VAL []BYTE frame, BYTE result)
+  -- A CGA frame places the 100 "even" 80-byte rows at #B8000, then the 100
+  -- "odd" 80-byte rows at #BA000. The video data therefore occupies a
+  -- 16192-byte region with an unused 192-byte "hole" in the middle. The frame
+  -- argument is structured differently: 100 80-byte "even" rows followed by
+  -- 100 80-byte "odd" rows, 16000 bytes in total.
+
+  #USE "msdos.lib"
+
+  VAL block.size IS 500 :  -- Nearly the largest block size for dos.send.block.
+  VAL block.size.int32 IS INT32 block.size :
+  INT32 address :  -- MSWord segment, LSWord offset
+  INT offset, len :
+  SEQ
+    result := spr.ok
+    offset := 0
+    SEQ
+      -- {{{Transmit the even rows.
+      address := #B8000000(INT32)  -- Top two bytes segment, bottom two offset
+      SEQ i = 0 FOR 16
+        IF
+          result <> spr.ok  -- If an error occurs, skip the rest of the copying
+            SKIP
+          result = spr.ok  -- Otherwise, copy the next bit of memory data
+            SEQ
+              VAL []BYTE block IS [frame FROM offset FOR block.size] :
+              dos.send.block (fs, ts, address, block, len, result)
+              PAR
+                address := address PLUS block.size.int32
+                offset := offset PLUS block.size
+      -- }}}
+      -- {{{Transmit the odd rows.
+      address := #BA000000(INT32)  -- Top two bytes segment, bottom two offset
+      SEQ i = 0 FOR 16
+        IF
+          result <> spr.ok  -- If an error occurs, skip the rest of the copying
+            SKIP
+          result = spr.ok  -- Otherwise, copy the next bit of memory data
+            SEQ
+              VAL []BYTE block IS [frame FROM offset FOR block.size] :
+              dos.send.block (fs, ts, address, block, len, result)
+              PAR
+                address := address PLUS block.size.int32
+                offset := offset PLUS block.size
+      -- }}}
+:

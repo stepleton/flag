@@ -1,0 +1,65 @@
+-- CGA display utilities test
+
+#INCLUDE "hostio.inc"
+#INCLUDE "msdos.inc"
+
+#INCLUDE "cga.inc"
+
+
+-- Fill a screen with mostly random garbage and await a keypress
+PROC CgaTest (CHAN OF SP fs, ts, []INT unused.memory)
+
+  #USE "hostio.lib"
+  #USE "cga"
+
+  [kCgaBufferBytes]BYTE frame :
+  BYTE result, key :
+  SEQ
+    -- Fill the frame with recognisable nonsense
+    PAR i = 0 FOR (80 * 200)
+      frame[i] := BYTE (#FF /\ i)
+
+    -- Go into a CGA graphics mode
+    CgaVideoMode (fs, ts, TRUE, FALSE, TRUE, TRUE, result)
+    ASSERT (result = spr.ok)
+
+    -- Display the nonsense
+    CgaDisplayFrame (fs, ts, frame, result)
+    ASSERT (result = spr.ok)
+
+    -- Await a keypress
+    so.getkey (fs, ts, key, result)
+
+    -- Clear the screen and display that, then await a keypress
+    CgaClear (frame)
+    CgaDisplayFrame (fs, ts, frame, result)
+    ASSERT (result = spr.ok)
+    so.getkey (fs, ts, key, result)
+
+    -- Draw a short vertical line and display, then await a keypress
+    SEQ y = 0 FOR 20
+      SEQ
+        frame[(80 * y) + 15] := #03(BYTE)
+        frame[(80 * y) + (8000 + 15)] := #03(BYTE)
+    CgaDisplayFrame (fs, ts, frame, result)
+    ASSERT (result = spr.ok)
+    so.getkey (fs, ts, key, result)
+
+    -- Add CgaDraw pixels to the screen and display, then await a keypress
+    SEQ x = 0 FOR 200
+      SEQ
+        SEQ c = 0 FOR 5
+          CgaDraw (x + (10 * c), x, (c + 3) REM 4, kCgaPalette, frame)
+        SEQ c = 0 FOR 20
+          CgaDraw (x + (90 + c), x, c REM 4, kCgaPalette, frame)
+    CgaDisplayFrame (fs, ts, frame, result)
+    ASSERT (result = spr.ok)
+    so.getkey (fs, ts, key, result)
+
+    -- Return to text mode
+    CgaVideoMode (fs, ts, FALSE, FALSE, FALSE, FALSE, result)
+    ASSERT (result = spr.ok)
+
+    -- Quit!
+    so.exit (fs, ts, sps.success)
+:

@@ -1,0 +1,94 @@
+-- Transputer/occam flag simulation -- worker configuration as the boss sees it
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+
+
+-- {{{***** Includes *****
+#INCLUDE "flagconf.inc"
+-- }}}
+
+
+-- {{{FlagConfig -- try to send flag configuration to workers
+--
+-- Args:
+--   num.workers: Number of workers in the (linear) transputer network (a.k.a.
+--       the "chain of workers")
+--   rows, columns: Number of rows and columns of flag elements, where "rows"
+--       are lines of elements parallel to the hoist and "columns" are elements
+--       perpendicular to the hoist
+--   to.up: Outbound channel reaching the first ("lowest") worker in the chain
+--       of workers
+--   from.up: Inbound channel receiving data from the first ("lowest") worker
+--       in the chain of workers
+--   max.elements.per.worker: Receives the maximum number of elements that fit
+--       on the worker with the least memory available to it.
+--   result: Result value 
+PROC FlagConfig (VAL INT num.workers, rows, columns,
+                 CHAN OF INT to.up, from.up,
+                 INT max.elements.per.worker, result)
+
+  -- Division for positive values, but any remainder rounds the result upwards
+  INT FUNCTION RoundUpDiv (VAL INT a, b) IS (a / b) + (INT ((a REM b) > 0)) :
+
+  SEQ
+    result := kFlagConfigSuccess  -- Assume success first.
+
+    -- {{{CONFIG STAGE ONE
+    -- Determining the maximum number of elements that can fit on the worker
+    -- with the least memory. If evenly distributing the rows across the worker
+    -- pool could cause a worker to exceed this number of elements, report an
+    -- error result.
+    IF
+      result <> kFlagConfigSuccess  -- Problem found earlier; do nothing
+        SKIP
+      TRUE  -- All systems are still go, carry on!
+        to.up ! num.workers - 1  -- Send # of workers above first worker
+        -- It would be nice if ALT allowed you to time out a send instead of
+        -- just a receive. If we really wanted to do this, there's always
+        -- OutputOrFail.t from xlink.lib.
+
+    IF  -- Glean from workers the max number of elements per worker
+      result <> kFlagConfigSuccess  -- Receiving a value here is a really good
+        SKIP                        -- sign that the transputer network is
+      TRUE                          -- running our program correctly
+        from.up ? max.elements.per.worker
+
+    IF  -- From that, see if our flag distributes evenly across the network
+      result <> kFlagConfigSuccess
+        SKIP
+      TRUE
+        VAL rows.per.worker IS RoundUpDiv (rows, num.workers) :
+        VAL elements.per.worker IS rows.per.worker * columns :
+        VAL problematic IS elements.per.worker > max.elements.per.worker :
+        result := kFlagConfigTooBig * (INT problematic)
+    -- }}}
+
+    -- {{{CONFIG STAGE TWO
+    -- Sending configuration parameters to the workers now that we know that
+    -- the flag can be spread evenly across all transputers in the network.
+    IF
+      result <> kFlagConfigSuccess
+        SKIP
+      TRUE
+        INT rows.echo :
+        SEQ
+          -- Send work configuration
+          to.up ! num.workers - 1  -- This many workers are above the first
+          to.up ! 0                -- There are no workers below the first
+          to.up ! rows             -- The flag has this many rows
+          to.up ! columns          -- The flag has this many columns
+
+          -- We should now hear back from the bottom worker about how many rows
+          -- the workers are ready to process altogether. It should match the
+          -- number of rows in the flag.
+          from.up ? rows.echo
+          IF
+            result <> kFlagConfigSuccess
+              SKIP
+            TRUE
+              -- And this check is just being on the safe side.
+              VAL problematic IS rows <> rows.echo :
+              result := kFlagConfigMismatch * (INT problematic)
+    -- }}}
+:
+-- }}}

@@ -1,0 +1,340 @@
+-- Transputer/occam flag simulation -- config/run workers; draw their outputs
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+
+
+-- {{{***** Includes *****
+#INCLUDE "hostio.inc"
+-- }}}
+
+
+-- {{{FlagBoss -- configure/start workers, then draw what they produce
+--
+-- The flag boss does not participate in flag simulation, naturally, but
+-- instead configures the workers and then plots the points that they calculate
+-- onto one of two video buffers; simultaneously, it sends the other video
+-- buffer out to the host for display.
+--
+-- The documentation for FlagWorker describes how the worker network is
+-- arranged in a bidirectional chain, with workers connected via inbound and
+-- outbound links to two neighbours. Words like "up", "down", "above", and
+-- "below" are used to describe how the workers are arranged relative to one
+-- another, since adjacent horizontal slices of the flag (which the simulation
+-- code --- but NOT the display code --- treats as if it were hanging
+-- vertically from a horizontal rod) are simulated by adjacent workers in the
+-- chain. The flag boss attaches to the bottom of the chain, just beneath the
+-- bottom worker.
+--
+-- The flag boss can operate in either of two modes: "headless mode" and...
+-- "all-in-one mode" I guess, both referring to what the boss does with the
+-- video frames that it renders. In headless mode, the flag (as a constellation
+-- of dots) is plotted to a flat buffer, which the boss makes available for a
+-- program running on the PC host to copy into video memory. In the other mode,
+-- the boss renders the dots to an interleaved buffer and then uses the
+-- "msdos.lib" hostio library to command the iserver to change video modes and
+-- to load data directly into CGA video memory.
+--
+-- All communications between the flag boss and the lowest worker in the chain
+-- use INTs (and since workers are 32-bit transputers, they must be 4-byte
+-- integers). The script for this communication is as follows:
+--
+-- 1. Boss sends: the number of workers minus one
+-- 2. Boss receives: how many flag elements the worker with the least memory
+--    availble to it can hold
+-- 3. Boss sends: the number of workers minus one (again)
+-- 4. Boss sends: 0 (yes, zero)
+-- 5. Boss sends: the number of flag elements in each row (a row is a line of
+--    flag elements parallel to the hoist)
+-- 6. Boss sends: the number of rows in the entire flag (also called "columns")
+-- (All steps so far are carried out by FlagConfig in flagconf.occ)
+-- Then, looping forever:
+-- 7. Boss receives (rows * columns) pairs of x, y points in CGA 320x200
+--    screen coordinates to plot, in reverse row-major order (through each
+--    column from left to right, in each row from BOTTOM to TOP --- note
+--    reverse order!)
+--
+-- In all-in-one mode, all communications with the PC host are handled on the
+-- PC host by the iserver and are not described here.
+--
+-- In headless mode, once the flag boss shuts down the iserver, it communicates
+-- with the PC host as follows (important: all transactions are in BYTEs, not
+-- INTs):
+--
+-- 1. Boss receives: any byte, indicating that the PC host is ready for the
+--    simulation to begin
+-- Then, looping forever:
+-- 2. Boss sends: a 16,000-byte, flat, 320x200x2 bits per pixel screen image
+--    to be interleaved and loaded into CGA video memory
+-- At any time during step 2, either of the following may occur:
+-- 3a. Boss receives: $78 (ASCII 'x'), indicating that it's time to stop the
+--     simulation
+-- 3b. Boss receives: a byte in $00..$09, indicating that the colour map should
+--     change to the corresponding flag
+--
+-- This procedure never terminates
+--
+-- Args:
+--   num.workers: Number of workers in the transputer network
+--   headless: Whether to operate in "headless" mode (see above)
+--   fs, ts: hostio channels
+--   from.ip: Inbound channel receiving data from our neighbour worker, the
+--       lowest worker on the chain
+--   to.down: Outbound channel reaching our neighbour worker, the lowest worker
+--       on the chain
+PROC FlagBoss (VAL INT num.workers, VAL BOOL headless,
+               CHAN OF SP fs, ts, CHAN OF INT from.up, to.up,
+               []BYTE colour.map.buffer)
+
+  -- {{{More includes, and units
+  #USE "hostio.lib"
+
+  #INCLUDE "cga.inc"
+  #INCLUDE "flagconf.inc"
+  #INCLUDE "flagflag.inc"
+
+  #USE "cga"
+  #USE "flagconf"
+  #USE "flagdraw"
+  #USE "flagflag"
+  -- }}}
+
+  -- {{{Configuration "globals": set at startup or config time; never changed
+  INT ROWS :        -- Size of dimension perpendicular to hoist, in elements
+  INT COLUMNS :     -- Size of dimension parallel to the hoist, in elements
+  -- The maximum number of elements that fits on the worker with the least RAM:
+  INT max.elements.per.worker :  -- (mostly here for lack of a better place)
+  -- }}}
+
+  -- {{{All state (some temporary variables too)
+  -- Two screen buffers for double-buffering. We assume (or hope) that the
+  -- transputers will outpace the display, but if it doesn't, that's OK: we'll
+  -- be rate-limited by the transputers anyhow.
+  [2][kCgaBufferBytes]BYTE frame.pair :
+  INT frames.drawn :   -- How many frames the transputers have drawn.
+
+  -- Various variables where routines we call can stash results.
+  INT result.int :
+  BYTE result.byte :
+
+  -- While TRUE, we should keep gathering and displaying flag data.
+  BOOL still.running :
+  -- }}}
+
+  -- {{{Retypings of the input and output channels
+  CHAN OF BYTE fsb RETYPES fs :  -- b as in "byte"
+  CHAN OF BYTE tsb RETYPES ts :
+  CHAN OF [kCgaBufferBytes]BYTE tsf RETYPES ts :  -- f as in "frame"
+  -- }}}
+
+  -- {{{Helper procedures for diagnostic messages
+  -- Say -- a shorter way to do so.write.string.nl
+  INLINE PROC Say (VAL []BYTE utterance)
+    so.write.string.nl (fs, ts, utterance)
+  :
+
+  -- SayInts -- a way to print several labeled integers
+  --
+  -- Args:
+  --   intro: A prefix string to print first
+  --   labels: A collection of N labels, all of the same length, to print in
+  --       front of the corresponding integer in ints
+  --   ints: A collection of N integers to print, each preceded by the
+  --       corresponding label in labels
+  PROC SayInts (VAL []BYTE intro, VAL [][]BYTE labels, VAL []INT ints)
+    SEQ
+      so.write.string (fs, ts, intro)
+      SEQ i = 0 FOR SIZE labels
+        SEQ
+          so.write.string (fs, ts, labels[i])
+          so.write.int (fs, ts, ints[i], 0)
+      so.write.nl (fs, ts)
+  :
+  -- }}}
+
+  -- HERE WE GO...
+  SEQ
+    -- {{{Petty initialisations
+    ROWS, COLUMNS := 40, 25  -- A fixed flag size for a start
+    SayInts ("Flag s", ["ize: rows=", ", columns="], [ROWS, COLUMNS])
+    ASSERT ((ROWS * COLUMNS) <= (SIZE colour.map.buffer))
+
+    frames.drawn := 0        -- Transputers have drawn no frames so far
+    still.running := TRUE    -- All systems GO for now...
+    -- }}}
+
+    -- "Allocate" space for the colour map. Don't have to but it'll be useful
+    -- for range checking until we decide to turn that off :-)
+    []BYTE colour.map IS [colour.map.buffer FROM 0 FOR ROWS * COLUMNS] :
+    SEQ
+      -- {{{More initialisations and worker configuration
+      -- Set up the colour map, clear out the frame we're going to display to
+      -- the screen, and configure the workers (worker configuration is here
+      -- just so it can run in parallel with other, lengthy initialisations)
+      Say ("Filling colour map, frame clearing, sending config...")
+      PAR
+        FlagFillColourMap (kFlagTrans, ROWS, COLUMNS, colour.map)
+        CgaClear (frame.pair[1])
+        FlagConfig (num.workers, ROWS, COLUMNS, to.up, from.up,
+                    max.elements.per.worker, result.int)
+
+      -- If worker config was a success, say the maximum number of elements
+      -- that fit on this worker.
+      IF
+        result.int <> kFlagConfigSuccess
+          SEQ
+            SayInts ("Configuration failed!", [" result="], [result.int])
+            so.exit (fs, ts, sps.failure)
+        TRUE
+          SayInts ("Configuration succeeded!",
+                   [" max.elements.per.worker="], [max.elements.per.worker])
+      -- }}}
+
+      -- {{{Time to go graphical!
+      -- If we're headless, that means telling the iserver to quit and
+      -- reminding the user to start the PC-side frontend; if not, it means
+      -- telling the iserver to call a DOS interrupt that puts us into one of
+      -- CGA's 320x200 4-colour graphics modes
+      Say ("Going graphical...")
+      IF
+        headless
+          SEQ
+            Say ("Shutting down the iserver. Please start the frontend now...")
+            so.exit (fs, ts, sps.success)
+            BYTE sync.byte :  -- Await a sync byte from the PC indicating that
+            fsb ? sync.byte   -- it's ready to start displaying flag frames
+        TRUE  -- All-in-one mode
+          CgaVideoMode (fs, ts, TRUE, FALSE, TRUE, TRUE, result.byte)
+      -- }}}
+
+      -- {{{DrawAndDisplayProcesses -- body of the flag boss's main loop
+      --
+      -- The main loop calls this embedded procedure with alternating display
+      -- frames and draw frames: this verbosity aims to make it really obvious
+      -- to the compiler that frame.draw and frame.display are not the same
+      -- frame
+      --
+      -- This procedure will run until exactly one video frame is drawn on the
+      -- PC host: once this occurs, the drawing process is allowed to finish
+      -- receiving and drawing flag element locations for the current flag, and
+      -- when this is done, the procedure exits
+      --
+      -- Args:
+      --   frame.draw: the CGA video frame that the process that collects and
+      --       draws data from the workers should use
+      --   frame.display: the CGA video frame that the process that displays
+      --       a frame on the PC host should use
+      --   frames.drawn.at.time.of.call: the value of DrawAndDisplayProcesses
+      --       when this procedure is called
+      PROC DrawAndDisplayProcesses ([]BYTE frame.draw, frame.display,
+                                    VAL INT frames.drawn.at.time.of.call)
+        BOOL keep.drawing :
+        SEQ
+          keep.drawing := TRUE  -- For now, the drawing process should carry on
+          CHAN OF BOOL drawing.control :  -- How "Display" tells "Draw" to stop
+          PAR
+            -- {{{The drawing process
+            -- This process keeps on receiving one flag's worth of data from
+            -- the workers and drawing it to one of the CGA buffers until the
+            -- display process finishes drawing to the display; if the display
+            -- process finishes up while the drawing process is in the midst of
+            -- drawing, the drawing process completes that flag and then exits
+            WHILE keep.drawing
+              PRI ALT
+                drawing.control ? keep.drawing  -- Has "Display" said "stop?"
+                  SKIP  -- If so, do nothing, we'll loop and test what it sent
+                TRUE & SKIP
+                  SEQ   -- If not, then receive & draw a flag from the workers
+                    -- If we're headless, we draw into a "flat" buffer (all
+                    -- rows in increasing order. Otherwise, we draw into a
+                    -- buffer whose first half is odd rows and whose second
+                    -- half is even rows --- CGA's memory organisation.
+                    IF
+                      headless
+                        FlagReceiveAndFlatDraw (ROWS, COLUMNS, colour.map,
+                                                from.up, frame.draw)
+                      TRUE  -- All-in-one mode
+                        FlagReceiveAndCgaDraw (ROWS, COLUMNS, colour.map,
+                                               from.up, frame.draw)
+                    frames.drawn := frames.drawn + 1
+            -- }}}
+            -- {{{The display process
+            -- The display process causes the contents of one of the CGA
+            -- buffers to be drawn to the screen; it only executes once and
+            -- then tells the draw process that it should stop after it
+            -- finishes drawing the flag it's drawing now to the other CGA
+            -- buffer
+            SEQ
+              -- Stamp the display frame with the number of frames drawn up to
+              -- and including the frame being displayed. (...I think!)
+              #INCLUDE "intsize.inc"
+              INT frame.num.bar RETYPES [frame.display FROM 0 FOR kSizeofInt] :
+              frame.num.bar := frames.drawn.at.time.of.call
+              -- Display the frame -- if we're headless, that means sending the
+              -- frame right out to the PC; otherwise that means sending
+              -- messages to the iserver to shove data into CGA video memory
+              IF
+                headless
+                  tsf ! frame.display
+                TRUE  -- All-in-one mode
+                  CgaDisplayFrame (fs, ts, frame.display, result.byte)
+              -- Indicate that the drawing and display frames should switch.
+              drawing.control ! FALSE
+            -- }}}
+          -- {{{Before returning: check for user input
+          -- Before returning, we quickly check whether the user would like
+          -- us to quit, or change the palette perhaps...
+          BYTE key :
+          IF
+            headless  -- {{{For headless mode
+              -- If we're in headless mode, we poll the link from the PC for
+              -- a byte. If that byte is 'x', then we quit. If the byte is
+              -- less than 10, then we reset the colour map to the colour map
+              -- indexed by that byte.
+              PRI ALT
+                fsb ? key
+                  IF
+                    key < 10(BYTE)
+                      FlagFillColourMap (INT key, ROWS, COLUMNS, colour.map)
+                    TRUE
+                      still.running := key <> 'x'
+                TRUE & SKIP
+                  SKIP
+            -- }}}
+            TRUE      -- {{{For all-in-one headless mode
+              -- If we're not in headless mode, we use hostio to poll the PC's
+              -- keyboard for any key. If there's any key, we just quit.
+              SEQ
+                so.pollkey (fs, ts, key, result.byte)
+                still.running := result.byte <> spr.ok
+            -- }}}
+          -- }}}
+      :
+      -- }}}
+      -- {{{The main flag boss loop itself
+      -- Note alternation of procedure arguments.
+      WHILE still.running
+        INT tmp :  -- This local copy of frames.drawn gets around something
+        SEQ        -- having to do with a "free variable".
+          tmp := frames.drawn
+          DrawAndDisplayProcesses (frame.pair[0], frame.pair[1], tmp)
+          tmp := frames.drawn
+          IF  -- Clumsy-looking but helps us stop ASAP if the user wants.
+            still.running
+              DrawAndDisplayProcesses (frame.pair[1], frame.pair[0], tmp)
+            TRUE
+              SKIP
+      -- }}}
+
+      -- {{{Finishing up before quitting
+      IF
+        headless
+          -- No need to do anything; the PC frontend will reset the video mode
+          SKIP
+        TRUE  -- All-in-one mode
+          -- Reset the video mode and tell the iserver to exit
+          SEQ
+            CgaVideoMode (fs, ts, FALSE, FALSE, FALSE, FALSE, result.byte)
+            so.exit (fs, ts, sps.success)
+      -- }}}
+:
+-- }}}

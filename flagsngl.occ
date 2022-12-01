@@ -1,0 +1,53 @@
+-- Transputer/occam flag simulation -- Non-headless operation on one transputer
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+--
+-- This file is virtually identical to flagsngh.occ, the "headless" version of
+-- this program. We use two files since occam appears to lack a preprocessor?
+
+
+-- {{{***** Includes *****
+#INCLUDE "hostio.inc"
+-- }}}
+
+
+-- {{{**** Constants *****
+VAL kHeadless IS FALSE :  -- Whether to run headless
+-- }}}
+
+
+-- {{{FlagSingle -- Non-headless, single-transputer flag demo
+--
+-- Args:
+--   fs, ts: hostio channels
+PROC FlagSingle (CHAN OF SP fs, ts, []INT memory)
+
+  -- {{{Units
+  #USE "flagboss"
+  #USE "flaglast"
+  -- }}}
+
+  -- {{{Memory allocation
+  -- Every flag element requires four INTs for its location and one BYTE for
+  -- its colour. That's 17 bytes in total for each element, 16 of which we hand
+  -- off to the flag worker, assuming a 4-byte integer. But we use a
+  -- calculation that is probably portable to 16-bit transputers, even though
+  -- they almost certainly couldn't do the fixed-point math that we need them
+  -- to do.
+  #INCLUDE "intsize.inc"
+  VAL memsize.colour IS (SIZE memory) / ((4 * kSizeofInt) + 1) :
+  VAL memsize.worker IS (SIZE memory) - memsize.colour :
+  []BYTE colour.map.buffer RETYPES [memory FROM 0 FOR memsize.colour] :
+  []INT memory.worker IS [memory FROM memsize.colour FOR memsize.worker] :
+  -- }}}
+
+  -- {{{Boss and worker processes
+  PAR
+    -- This is the "worker thread", if you like; we let it run indefinitely
+    FlagWorkerLast (upward, downward, memory.worker)
+    -- Here is the "boss thread", which we also let run indefinitely, but
+    -- which can command the iserver to exit; 1 == one worker
+    FlagBoss (1, kHeadless, fs, ts, downward, upward, colour.map.buffer)
+  -- }}}
+:
+-- }}}

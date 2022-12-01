@@ -1,0 +1,23 @@
+-- Transputer/occam flag simulation -- the flag worker at the top of the flag
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+
+
+-- FlagWorkerLast -- a flag worker with no upward connections
+--
+-- See flagwrkr.occ for more details about how flag workers work
+--
+-- Make certain that the network configuration tells the worker that there are
+-- no workers above it!
+--
+-- Args:
+--   from.down: Inbound channel receiving data from our neighbour worker (or
+--       the boss) lower on the chain
+--   to.down: Outbound channel reaching our neighbour worker (or the boss)
+--       lower on the chain
+--   memory: Memory space that the worker should use for storing flag state
+PROC FlagWorkerLast (CHAN OF INT from.down, to.down, []INT memory)
+  #USE "flagwrkr"
+  CHAN OF INT from.dummy, to.dummy :
+  FlagWorker (from.down, to.down, from.dummy, to.dummy, memory)
+:

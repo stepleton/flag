@@ -1,0 +1,108 @@
+-- Transputer/occam flag simulation -- rendering flags into pictures
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+
+
+-- {{{FlagReceiveAndCgaDraw -- receive flag coords and draw into a CGA frame
+--
+-- Receives flag element location data as a series of rows*columns pairs of
+-- ints over the channel from.up; draws the flag as coloured dots on a black
+-- background.
+--
+-- Args:
+--   rows, columns: Number of rows and columns of flag elements, where "rows"
+--       are lines of elements parallel to the hoist and "columns" are elements
+--       perpendicular to the hoist
+--   colour.map: A rows*columns array of byte elements with values in 0..3,
+--       arranged in row-major order, designating which colours to assign to
+--       each element when drawing
+--   from.up: Channel supplying x, y pairs of elements -- a pair's values are
+--       *valid* CGA screen coordinates (x in 0..319, y in 0..199) OR they are
+--       negative, meaning the pair should not be drawn. Pairs are supplied
+--       in row-reversed row-major order: the rows come bottom-first to
+--       top-last, but row elements come left-to-right.
+--   frame: An 80x200-byte array receiving data for an interleaved CGA video
+--       frame -- its first 8000 bytes holds the even rows of the frame and its
+--       second 8000 bytes holds the odd rows of same
+PROC FlagReceiveAndCgaDraw (VAL INT rows, columns, VAL []BYTE colour.map,
+                            CHAN OF INT from.up, []BYTE frame)
+
+  #INCLUDE "cga.inc"
+
+  SEQ
+    -- First, zero out the frame
+    CgaClear (frame)
+
+    -- Receive and draw flag elements individually. Note walking through
+    -- colour map rows in reverse, since that's the order in which we receive
+    -- elements from the workers.
+    SEQ r.rev = 1 FOR rows
+      VAL r IS rows - r.rev :
+      VAL []BYTE colour.row IS [colour.map FROM (r * columns) FOR columns] :
+      INT cga.x, cga.y :
+      SEQ c = 0 FOR columns
+        SEQ
+          -- Receive the next element location from the worker
+          from.up ? cga.x
+          from.up ? cga.y
+          -- Paint the element! The worker guarantees that any non-negative
+          -- coordinate value is valid.
+          IF
+            (cga.x > 0) AND (cga.y > 0)
+              CgaDraw (cga.x, cga.y, INT colour.row[c], kCgaPalette, frame)
+            TRUE
+              SKIP
+:
+-- }}}
+
+
+-- {{{FlagReceiveAndFlatDraw -- receive flag coords, draw to a flat CGA buffer
+--
+-- Receives flag element location data as a series of rows*columns pairs of
+-- ints over the channel from.up; draws the flag as coloured dots on a black
+-- background.
+--
+-- Args:
+--   rows, columns: Number of rows and columns of flag elements, where "rows"
+--       are lines of elements parallel to the hoist and "columns" are elements
+--       perpendicular to the hoist
+--   colour.map: A rows*columns array of byte elements with values in 0..3,
+--       arranged in row-major order, designating which colours to assign to
+--       each element when drawing
+--   from.up: Channel supplying x, y pairs of elements -- a pair's values are
+--       *valid* CGA screen coordinates (x in 0..319, y in 0..199) OR they are
+--       negative, meaning the pair should not be drawn. Pairs are supplied
+--       in row-reversed row-major order: the rows come bottom-first to
+--       top-last, but row elements come left-to-right.
+--   frame: An 80x200-byte array receiving data for a flat CGA video frame ---
+--       rows are stored contiguously in order.
+PROC FlagReceiveAndFlatDraw (VAL INT rows, columns, VAL []BYTE colour.map,
+                             CHAN OF INT from.up, []BYTE frame)
+
+  #INCLUDE "cga.inc"
+
+  SEQ
+    -- First, zero out the frame
+    CgaClear (frame)
+
+    -- Receive and draw flag elements individually. Note walking through
+    -- colour map rows in reverse, since that's the order in which we receive
+    -- elements from the workers.
+    SEQ r.rev = 1 FOR rows
+      VAL r IS rows - r.rev :
+      VAL []BYTE colour.row IS [colour.map FROM (r * columns) FOR columns] :
+      INT cga.x, cga.y :
+      SEQ c = 0 FOR columns
+        SEQ
+          -- Receive the next element location from the worker
+          from.up ? cga.x
+          from.up ? cga.y
+          -- Paint the element! The worker guarantees that any non-negative
+          -- coordinate value is valid.
+          IF
+            (cga.x > 0) AND (cga.y > 0)
+              FlatDraw (cga.x, cga.y, INT colour.row[c], kCgaPalette, frame)
+            TRUE
+              SKIP
+:
+-- }}}

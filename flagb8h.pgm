@@ -1,0 +1,97 @@
+-- Transputer/occam flag simulation -- headless multi-processor simulation
+-- vim: ft=occam
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+--
+-- This configuration file is specific to my own transputer setup, which
+-- comprises seven 32-bit transputers on a motley collection of TRAMs with
+-- different amounts of RAM. Unless your setup is very similar to mine, you'll
+-- need to change this file so that it reflects your equipment.
+--
+-- This file is virtually identical to flagb8.occ, the "non-headless" version
+-- of this program. We use two files since occam appears to lack a
+-- preprocessor?
+
+
+-- {{{Description of the transputer network on my B008
+NODE node0, node1, node3, node4, node5, node6, node7, node8 :
+ARC hostlink :
+NETWORK
+  DO
+    -- {{{Processors and their memory
+    -- node0 and node7 are actually T800 TRAMs, but we are listing them as
+    -- T414s so that the development tools won't complain when we try to load
+    -- compiled code for T414s (which is 100% compatible for our needs) on them
+    SET node0 (type, memsize := "T414", 2052*1024)  -- actually a T800
+    SET node1 (type, memsize := "T212",    4*1024)
+    SET node3 (type, memsize := "T414", 1026*1024)
+    SET node4 (type, memsize := "T414", 1026*1024)
+    SET node5 (type, memsize := "T414",   34*1024)
+    SET node6 (type, memsize := "T414",   34*1024)
+    SET node7 (type, memsize := "T414", 2052*1024)  -- actually a T800
+    SET node8 (type, memsize := "T414", 1026*1024)
+    -- }}}
+
+    -- {{{Connections between processors
+    -- The program requires the chain topology seen here; node0 must be the
+    -- flag boss since it's the one connected to the PC host
+    CONNECT node0[link][0] TO HOST WITH hostlink
+    CONNECT node0[link][1] TO node1[link][1]
+    CONNECT node0[link][2] TO node3[link][1]
+    CONNECT node3[link][2] TO node4[link][1]
+    CONNECT node4[link][2] TO node5[link][1]
+    CONNECT node5[link][2] TO node6[link][1]
+    CONNECT node6[link][2] TO node7[link][1]
+    CONNECT node7[link][2] TO node8[link][1]
+    -- }}}
+:
+-- }}}
+
+
+-- {{{Description of the software running on each processor node
+#INCLUDE "hostio.inc"
+#USE "flagboss.c4h"
+#USE "flaglast.c4h"
+#USE "flagwrkr.c4h"
+CONFIG
+  -- Declare the links between node0 and the host to be hostio channels
+  CHAN OF SP fs, ts :
+  PLACE fs, ts ON hostlink :
+
+  -- Between the transputers: six links between seven nodes
+  [6]CHAN OF INT upwards, downwards :
+
+  -- {{{Distributing processes on the separate processors
+  -- It would be nice if we could scale the memory array for each processor to
+  -- the total amount of free memory available on the processor, but there
+  -- doesn't seem to be an easy way to do this --- so we just pick 4096, a
+  -- value that fits on our 32K TRAMs (taking half the RAM) and that would be
+  -- a pretty big (and slow) flag regardless
+  PAR
+    PROCESSOR node0
+      VAL kNumWorkers IS 6 :
+      VAL kHeadless IS TRUE :
+      [4096]BYTE colour.map.buffer :
+      FlagBoss (kNumWorkers, kHeadless,
+                fs, ts, downwards[0], upwards[0], colour.map.buffer)
+    PROCESSOR node3
+      [4096]INT memory :
+      FlagWorker (upwards[0], downwards[0], downwards[1], upwards[1], memory)
+    PROCESSOR node4
+      [4096]INT memory :
+      FlagWorker (upwards[1], downwards[1], downwards[2], upwards[2], memory)
+    PROCESSOR node5
+      [4096]INT memory :
+      FlagWorker (upwards[2], downwards[2], downwards[3], upwards[3], memory)
+    PROCESSOR node6
+      [4096]INT memory :
+      FlagWorker (upwards[3], downwards[3], downwards[4], upwards[4], memory)
+    PROCESSOR node7
+      [4096]INT memory :
+      FlagWorker (upwards[4], downwards[4], downwards[5], upwards[5], memory)
+    PROCESSOR node8
+      [4096]INT memory :
+      FlagWorkerLast (upwards[5], downwards[5], memory)
+  -- }}}
+:
+-- }}}

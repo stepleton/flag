@@ -1,0 +1,857 @@
+-- Transputer/occam flag simulation -- simulating a slice of the flag
+--
+-- Forfeited into the public domain with NO WARRANTY. Read LICENSE for details.
+--
+-- This code makes use of fixed-point arithmetic and is suitable for use on
+-- all 32-bit transputers.
+
+
+-- {{{***** Constants *****
+VAL kUnitPower IS 12 :          -- Fixed-point math. 1.0 is 2**kUnitPower.
+VAL kUnit IS 1 << kUnitPower :  -- Don't change this, change kUnitPower.
+
+VAL kAccuracy IS 3 :  -- How often we'll loop the Resolve procedure.
+
+VAL kGravity IS kUnit * (-6):  -- Physical constants. Here's gravity's strength.
+VAL kFriction IS (kUnit * 990) / 1000 :  -- Coefficient of friction: 0.99.
+VAL kDt IS (kUnit * 24) / 1000 :  -- Real-world clock increment: 0.024.
+VAL kDtDt IS (kDt * kDt) / kUnit :  -- Square of the clock increment.
+-- }}}
+
+
+-- {{{FlagWorker -- simulate a slice of a flag, as part of a team of workers
+--
+-- This procedure engages a transputer in a parallel computation with other
+-- transputers ("workers") to simulate a flag flying in the breeze. The
+-- simulation takes the form of simulated point masses ("flag elements") in 2-D
+-- connected to their (four-way) neighbour point masses by simulated springs.
+-- This is a poor physical analogue to a real flag, which exists in 3-D, not
+-- 2-D: the point is to make something that looks acceptable.
+--
+-- The algorithm is essentially an Occam port of the JS demo found here:
+--   https://codepen.io/dissimulate/pen/nYQrNP
+-- which a Redditor claims is derived from their tutorial here:
+--   https://gamedevelopment.tutsplus.com/tutorials/simulate-tearable-cloth-an
+--   d-ragdolls-with-simple-verlet-integration--gamedev-519
+--
+-- Flag workers are arranged in a bidirectional chain topology: that is, each
+-- worker has an inbound and an outbound link to two workers, one "above" it
+-- and one "below" it. To understand this "above" and "below" terminology: the
+-- flag simulation pretends that the flag is being hung vertically from its
+-- hoist -- each worker is responsible for simulating a horizontal "slice" of
+-- the flag, the neighbour worker "above" is responsible for a slice closer to
+-- the hoist, and the worker "below" is responsible for a slice that's further
+-- away. (For the worker/slice at the very top of the flag, which has no
+-- workers above it, see flaglast.occ.)
+-- 
+-- Workers operate in three overall phases:
+-- * a configuration phase where the transputers in the network that are
+--   designated to be workers choose how to share the simulation task
+-- * a calculation phase where the transputers compute updated locations for
+--   all the flag elements
+-- * an export phase where the flag element locations are projected into CGA
+--   screen coordinates (Modes 4 and 5, 320x200 pixels) after having been
+--   rotated 90 degrees anticlockwise. The rotation is a cheap trick that
+--   gives the impression of a flag flying in a stiff wind rather than hanging
+--   downward and fluttering a bit
+-- The configuration phase happens only once, and then the network alternates
+-- between the calculation and export phases.
+--
+-- Additional documentation of how the simulation works appears alongside
+-- definitions of nested subroutines. For here, leftover notes:
+-- * Some phenomenon attributable to the fixed-point arithmetic being used
+--   (maybe in FastMul) causes the hanging flag to drape to the left (or
+--   after the rotation, to drape downward on the screen). When displayed,
+--   this looks like gravity at work on the flag, so we'll keep it.
+--
+-- This procedure never terminates
+--
+-- Args:
+--   from.down: Inbound channel receiving data from our neighbour worker (or
+--       the boss) lower on the chain
+--   to.down: Outbound channel reaching our neighbour worker (or the boss)
+--       lower on the chain
+--   from.ip: Inbound channel receiving data from our neighbour worker higher
+--       on the chain
+--   to.down: Outbound channel reaching our neighbour worker higher on the
+--       chain
+--   memory: Memory space that the worker should use for storing flag state
+PROC FlagWorker (CHAN OF INT from.down, to.down, from.up, to.up, []INT memory)
+
+  -- {{{Configuration "globals": set during config and never changed
+  -- Describing the part of the flag the worker is responsible for:
+  INT COLUMNS :     -- # of elements per row (i.e. along the axis of the hoist)
+  INT ROWS :        -- How many element rows we're handling on this worker
+  INT ROWS.ABOVE :  -- How many element rows are handled by workers "above" us
+  BOOL BOTTOM :     -- Are we handling the bottom of the flag?
+
+  -- For converting flag element coordinates to CGA screen coordinates:
+  INT TO.CGA.X.MUL, TO.CGA.Y.MUL, TO.CGA.DIV :
+  INT TO.CGA.X.OFFSET, TO.CGA.Y.OFFSET :
+
+  -- Miscellanous values:
+  INT VELOCITY.X.WRAP :  -- Scaling parameters for the periodic functions...
+  INT VELOCITY.Y.WRAP :  -- ...that apply wind-like forces to the flag.
+  -- }}}
+
+
+  -- {{{All state for our slice of the flag: time, and buffers for flag data
+  INT time :
+  -- The maximum number of elements that this worker can accommodate:
+  VAL max.elements IS (SIZE memory) / 4 :  -- Four flag data arrays, below:
+  []INT flag.x IS [memory FROM 0 FOR max.elements] :
+  []INT flag.y IS [memory FROM max.elements FOR max.elements] :
+  []INT flag.prev.x IS [memory FROM (2 TIMES max.elements) FOR max.elements] :
+  []INT flag.prev.y IS [memory FROM (3 TIMES max.elements) FOR max.elements] :
+  -- }}}
+
+
+  -- {{{Inlined fixed-point arithmetic helpers
+  -- Fix -- convert an integer to fixed-point; a must be in -(2^19)..(2^19-1)!
+  INT INLINE FUNCTION Fix (VAL INT a) IS a << kUnitPower :
+
+  -- Mul -- slower fixed-point multiplication of a and b; no overflow checking!
+  INT INLINE FUNCTION Mul (VAL INT a, b) IS (a TIMES b) / kUnit :
+  -- Div -- fixed-point division of a by b; no overflow checking!
+  INT INLINE FUNCTION Div (VAL INT a, b) IS (a << kUnitPower) / b :
+
+  -- FastMul -- faster fixed-point a*b multiplication for critical sections
+  INT INLINE FUNCTION FastMul (VAL INT a, b)
+    VAL a.times.b IS a TIMES b :
+    INT c :
+    VALOF
+      -- Replace a division by 2**kUnitPower with an arithmetic shift left,
+      -- which shaves off a bit over a third of the time. Tranputer does not
+      -- have this instruction natively, so we need to use several others.
+      -- Based on Transputer Assembler Language Programming, PDF page 39.
+      -- Original code: c := a.times.b / kUnit
+      ASM
+        LD a.times.b    -- Load a * b into A.    2 cycles, assuming LDL
+        XDBLE           -- Sign-extend A into B. 2 cycles
+        LDC kUnitPower  -- Push kUnitPower.      2 cycles (because PRFX?)
+        LSHR            -- Long shift right.     15 cycles if kUnitPower == 12
+        ST c            -- Store A into diff.    1 cycle if LDL. TOTAL: 23
+      RESULT c
+  :
+
+  -- Abs -- absolute value of a
+  INT INLINE FUNCTION Abs (VAL INT a)
+    INT a.abs :
+    VALOF
+      IF
+        a < 0
+          a.abs := -a
+        TRUE  -- a >= 0
+          a.abs := a
+      RESULT a.abs
+  :
+
+
+  -- Min -- minimum of a and b
+  INT INLINE FUNCTION Min (VAL INT a, b)
+    INT ab.min :
+    VALOF
+      IF
+        a < b
+          ab.min := a
+        TRUE  -- a >= b
+          ab.min := b
+      RESULT ab.min
+  :
+
+
+  -- {{{Hypot -- fixed-point calculation of sqrt(a*a + b*b)
+  --
+  -- See https://blogs.mathworks.com/cleve/2012/07/30/pythagorean-addition/
+  -- Note: It's OK to inline this function since it's only used in one spot
+  VAL k4 IS Fix (4) :
+  INT INLINE FUNCTION Hypot (VAL INT a, b)  -- Fixed-point sqrt(a * a + b * b)
+    VAL abs.a IS Abs (a) :
+    VAL abs.b IS Abs (b) :
+    INT x, y :
+    VALOF
+      SEQ
+        -- Assign to x and y the max and min of |a| and |b| respectively.
+        IF
+          abs.a > abs.b
+            x, y := abs.a, abs.b
+          TRUE  -- abs.a <= abs.b
+            x, y := abs.b, abs.a
+        -- If |a| and |b| were both 0, then the hypotenuse is 0 too. Otherwise,
+        -- an unrolled rendition of the loop described at the address above.
+        IF
+          x <= 0
+            x := 0
+          TRUE  -- x > 0
+            INT r, s :
+            SEQ
+              r := Div (y, x)
+              r := FastMul (r, r)
+              s := Div (r, r + k4)
+              x := x + (FastMul (s, x) << 1)
+              y := FastMul (s, y)
+
+              r := Div (y, x)
+              r := FastMul (r, r)
+              s := Div (r, r + k4)
+              x := x + (FastMul (s, x) << 1)
+              y := FastMul (s, y)
+
+              r := Div (y, x)
+              r := FastMul (r, r)
+              s := Div (r, r + k4)
+              x := x + (FastMul (s, x) << 1)
+      RESULT x
+  :
+  -- }}}
+
+  -- PyMod -- Python-style a % b (reflecting flooring a / b); ASSUMES B > 0!
+  INT INLINE FUNCTION PyMod (VAL INT a, b)
+    INT a.mod.b :
+    VALOF
+      IF
+        a >= 0
+          a.mod.b := a REM b
+        TRUE  -- a < 0
+          a.mod.b := b + (a REM b)
+      RESULT a.mod.b
+  :
+  -- }}}
+
+
+  -- {{{Config -- worker configuration and division of labour
+  --
+  -- Stages of the configuration procedure are described within the code;
+  -- transactions between the boss and the lowest worker on the chain are as
+  -- follows:
+  --
+  -- 1. Boss sends a single integer indicating the number of workers above
+  --    the lowest worker on the chain: this should be the total number of
+  --    workers minus one
+  -- 2. Boss receives a single integer indicating how many flag elements the
+  --    worker with the least memory available to it can hold
+  -- 3. Boss sends four integers in sequence:
+  --    1. The total number of workers minus one (again)
+  --    2. 0 (yes, zero: the code may reveal why this makes sense)
+  --    3. The number of rows of flag elements in the entire flag (a row is
+  --       a line of elements parallel to the hoist)
+  --    4. The number of columns of flag elements in the entire flag (a column
+  --       is a line of elements perpendicular to the hoist)
+  -- 4. Boss receives a single integer that should be the same number as the
+  --    total number of rows it sent out in the previous step
+  --
+  -- Once configuration is complete, then as this procedure is used in
+  -- FlagWorker, there is nothing more for the boss to do but wait for the
+  -- coordinates of points to plot: see the Transmit procedure
+  --
+  -- Args:
+  --   none
+  PROC Config ()
+    INT workers.above :  -- To be computed: Number of workers "above" us
+    INT workers.below :  -- To be computed: Number of workers "below" us
+    INT rows.total :     -- TBC: Total number of element rows in the flag
+
+    SEQ
+      -- {{{CONFIGURATION STAGE ONE: finding flag size limitations
+      -- Determine the maximum number of elements that can fit on the worker
+      -- whose FlagWorker procedure was called with the tiniest memory argument
+      from.down ? workers.above
+      IF
+        workers.above > 0
+          INT max.elements.up :
+          SEQ
+            to.up ! workers.above - 1
+            from.up ? max.elements.up
+            to.down ! Min (max.elements, max.elements.up)
+        TRUE  -- No workers above us
+          to.down ! max.elements
+      -- }}}
+
+      -- {{{CONFIGURATION STAGE TWO: distributing work across the workers
+      -- Receive our local configuration from below: four words in sequence
+      from.down ? workers.above
+      from.down ? workers.below
+      from.down ? rows.total
+      from.down ? COLUMNS
+
+      -- Validate config
+      ASSERT (workers.above >= 0)  -- Avoid silly values
+      ASSERT (workers.below >= 0)
+      ASSERT (COLUMNS > 0)  -- Our flag must have at least one column
+      ASSERT (rows.total >= (workers.above + 1))  -- At least 1 row per worker
+
+      -- {{{Pass config along to workers above us
+      IF
+        workers.above > 0  -- If there are workers above us:
+          SEQ
+            -- First pass along local configuration for the next worker above
+            to.up ! workers.above - 1
+            to.up ! workers.below + 1
+            to.up ! rows.total
+            to.up ! COLUMNS
+
+            -- Await that worker telling us how many rows are above them
+            from.up ? ROWS.ABOVE
+
+        TRUE  -- But if there aren't workers above us:
+          ROWS.ABOVE := 0  -- Then there aren't any rows above us either
+      -- }}}
+
+      -- How many rows should we reserve for ourselves?
+      ROWS := (rows.total - ROWS.ABOVE) / (workers.below + 1)
+
+      -- Is that too many rows? If so, fail.
+      ASSERT ((ROWS * COLUMNS) <= max.elements)
+      -- }}}
+
+      -- {{{CONFIGURATION STAGE THREE: miscellanous finishing up
+      PAR
+        -- Save whether we're handling the bottom of the flag.
+        BOTTOM := workers.below <= 0
+        -- Tell the worker below us (or the leader) how many rows there are
+        -- above it. If the leader receives the total number of rows, it can
+        -- be reasonably certain that the whole network of workers is ready to
+        -- start flying the flag.
+        to.down ! ROWS.ABOVE + ROWS
+        -- Set these scaling parameters for the periodic functions that apply
+        -- wind-like forces to the flag. The X parameter is columns / 2.5.
+        VELOCITY.X.WRAP := Div(Fix (COLUMNS), Div (Fix (5), Fix (2)))
+        VELOCITY.Y.WRAP := Fix (rows.total)
+
+        -- {{{Flag-to-screen transformation constants
+        -- Derive constants for scaling flag coordinates, which range from
+        -- [0, COLUMNS) and [0, -rows.total), to CGA screen coordinates.
+        -- Note that we wish to rotate the flag 90 degrees anticlockwise.
+        -- Recall also that CGA pixels are not squares.
+        IF 
+          (rows.total * 4) > (COLUMNS * 3)
+            SEQ
+              -- If here, the rotated flag is ===== while the screen is [ ]
+              TO.CGA.X.MUL, TO.CGA.Y.MUL := -312, -260
+              TO.CGA.DIV := rows.total * kUnit
+              TO.CGA.X.OFFSET := 4
+              TO.CGA.Y.OFFSET := 194 + ((TO.CGA.Y.MUL * COLUMNS) / rows.total)
+              TO.CGA.Y.OFFSET := 197 - (TO.CGA.Y.OFFSET / 2)
+          TRUE  -- (rows.total * 4) < (COLUMNS * 3)
+            SEQ
+              -- If here, the rotated flag is || while the screen is [ ]
+              TO.CGA.X.MUL, TO.CGA.Y.MUL := -233, -194
+              TO.CGA.DIV := COLUMNS * kUnit
+              TO.CGA.X.OFFSET := 312 + ((TO.CGA.X.MUL * rows.total) / COLUMNS)
+              TO.CGA.X.OFFSET := 4 + (TO.CGA.X.OFFSET / 2)
+              TO.CGA.Y.OFFSET := 197
+        -- }}}
+      -- }}}
+  :
+  -- }}}
+
+  -- {{{Periodic forces acting on flag elements (wind/fluttering appearance)
+  -- {{{VelocityX -- compute additional flag element X velocity for fluttering
+  --
+  -- The X velocity is based on a crude sine wave approximation (a truncated
+  -- triangle wave) whose phase drifts over time. This function and its
+  -- parameters have no physical significance: they were just tweaked until
+  -- they looked interesting enough.
+  --
+  -- Note: It's OK to inline this function since it's only used in one spot
+  --
+  -- Args:
+  --   x: X location of a flag element
+  --   time.times.16.minus.k3: A linear scaling and displacement of the current
+  --       simulation time, hoisted outside of this function for efficiency as,
+  --       at each timestep, the function will be invoked with the same value
+  --       here for each flag element
+  --
+  -- Returns: additional X velocity for a flag element whose X location is x
+  VAL k18 IS Fix (18) :
+  VAL k120 IS Fix (120) :
+  VAL k30 IS Fix (30) :
+  VAL k0.5 IS Div (Fix (1), Fix (2)) :
+  INT INLINE FUNCTION VelocityX (VAL INT x, time.times.16.minus.k3)
+    INT v :
+    VALOF
+      SEQ
+        v := Div (PyMod ((x + time.times.16.minus.k3), VELOCITY.X.WRAP),
+                  VELOCITY.X.WRAP)
+        v := Abs (FastMul (k120, k0.5 - v)) - k30
+        IF
+          v > k18
+            v := k18
+          v < (-k18)
+            v := -k18
+          TRUE  -- -k18 < v < k18
+            SKIP
+      RESULT v
+  :
+  -- }}}
+
+  -- {{{VelocityY -- compute additional flag element Y velocity for fluttering
+  --
+  -- The Y velocity is based on a crude sine wave approximation (a truncated
+  -- triangle wave) whose phase drifts over time. This function and its
+  -- parameters have no physical significance: they were just tweaked until
+  -- they looked interesting enough.
+  --
+  -- Note: It's OK to inline this function since it's only used in one spot
+  --
+  -- Args:
+  --   y: Y location of a flag element
+  --   time.times.64: A linear scaling of the current simulation time, hoisted
+  --       outside of this function for efficiency as, at each timestep, the
+  --       function will be invoked with the same value here for each flag
+  --       element
+  --
+  -- Returns: additional Y velocity for a flag element whose Y location is y
+  VAL k26 IS Fix (26) :
+  VAL k160 IS Fix (160) :
+  VAL k40 IS Fix (40) :
+  INT INLINE FUNCTION VelocityY (VAL INT y, time.times.64)
+    INT v :
+    VALOF
+      SEQ
+        v := Div (PyMod ((y + time.times.64), VELOCITY.Y.WRAP), VELOCITY.Y.WRAP)
+        v := Abs (FastMul (k160, k0.5 - v)) - k40
+        IF
+          v > k26
+            v := k26
+          v < (-k26)
+            v := -k26
+          TRUE  -- -k26 < v < k26
+            SKIP
+      RESULT v + kGravity  -- Note addition of gravity.
+  :
+  -- }}}
+  -- }}}
+
+
+  -- {{{Update -- compute flag element locations without constraints
+  --
+  -- The unconstrained location of each flag element at timestep t+1 is
+  -- computed as its location at time t plus:
+  -- * the difference between its t and t-1 locations, slightly damped
+  -- * the additional velocities computed by VelocityX and VelocityY, scaled
+  --   by kDt
+  -- Once this new location is computed, it's necessary to apply constraints
+  -- that snap the flag elements back into an arrangement that's more
+  -- consistent with a single piece of fabric (instead of exploding apart into
+  -- its constitutent atoms).
+  --
+  -- Args:
+  --   none
+  VAL k3 IS Fix (3) :
+  PROC Update ()
+    INT time.times.16.minus.k3, time.times.64 :
+    SEQ
+      -- These funny-looking values are used by the VelocityX and VelocityY
+      -- functions. We've hoisted them outside those functions for efficiency.
+      time.times.16.minus.k3 := (time << 4) - k3
+      time.times.64 := time << 6
+
+      -- {{{Compute new locations, row by row and then column by column
+      SEQ r = 0 FOR ROWS
+        -- Extensive use of aliasing in this code may help the compiler
+        -- optimise: see INMOS technical note 17:
+        -- https://www.transputer.net/tn/17/tn17.html
+        []INT row.x IS [flag.x FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.y IS [flag.y FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.prev.x IS [flag.prev.x FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.prev.y IS [flag.prev.y FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        SEQ c = 0 FOR COLUMNS
+          PAR
+            -- {{{X location update
+            INT tmp.x :
+            INT pos.x IS row.x[c] :
+            INT pos.prev.x IS row.prev.x[c] :
+            SEQ
+              tmp.x := ((pos.x + FastMul (kFriction, pos.x - pos.prev.x)) +
+                        FastMul (kDtDt,
+                                 VelocityX (pos.x, time.times.16.minus.k3)))
+              pos.prev.x := pos.x
+              pos.x := tmp.x
+            -- }}}
+            -- {{{Y location update
+            INT tmp.y :
+            INT pos.y IS row.y[c] :
+            INT pos.prev.y IS row.prev.y[c] :
+            SEQ
+              tmp.y := ((pos.y + FastMul (kFriction, pos.y - pos.prev.y)) +
+                        FastMul (kDtDt, VelocityY (pos.y, time.times.64)))
+              pos.prev.y := pos.y
+              pos.y := tmp.y
+            -- }}}
+      -- }}}
+
+      -- {{{Pinning the flag to the hoist
+      -- If there are no rows above us, pin all elements in the top row back to
+      -- their original locations along the hoist.
+      IF
+        ROWS.ABOVE = 0
+          SEQ
+            SEQ c = 0 FOR COLUMNS
+              flag.x[c], flag.y[c], flag.prev.y[c] := Fix (c), 0, 0
+            [flag.prev.x FROM 0 FOR COLUMNS] := [flag.x FROM 0 FOR COLUMNS]
+        TRUE
+          SKIP
+      -- }}}
+  :
+  -- }}}
+
+
+  -- {{{Resolution: applying constraints that keep the flag from flying apart
+  --
+  -- The resolution process goes through each of the flag elements row by row,
+  -- column by column, examining every "link" between pairs of adjacent flag
+  -- elements. If a link is found to be longer or shorter than 1.0, then the
+  -- two elements at each end of the link are moved closer together or further
+  -- apart respectively. This process is repeated a few times (kAccuracy),
+  -- often enough to keep the flag looking realistic. Extra repetitions don't
+  -- buy you very much: the resolution procedure converges fairly rapidly.
+  --
+  -- The resolution process acts locally: when it adjusts the length of one
+  -- link to enforce the length-1.0 constraint, it may wind up distorting other
+  -- nearby links, including ones that it may have just adjusted a short while
+  -- while earlier. The fact that the resolution procedure happens this way, in
+  -- the order that it does, seems important to making sure that the flag
+  -- elements wind up violating their constraints a *little bit*, in an
+  -- attractive way (rippling, fluttering, etc.), instead of just turning into
+  -- a swinging board or a jiggling set of slats/venetian blinds.
+
+  -- {{{ConstraintDelta -- How two points should move to satisfy constraints
+  --
+  -- Args:
+  --   x2, y2: X and Y coordinates of "point two" on one side of a "link"
+  --       between two connected points
+  --   x1, x1: X and Y coordinates of "point one" on the other side of the
+  --       link from point two
+  --
+  -- Returns: two ints ---
+  --   First: Add this amount to x1, and subtract it from x2, to favour the
+  --       constraint that links should have length 1; plus:
+  --   Second: Add this amount to y1, and subtract it from y2, to favour the
+  --       constraint that links should have length 1
+  INT, INT FUNCTION ConstraintDelta (VAL INT x2, y2, x1, y1)
+    INT dx, dy, diff :
+    VALOF
+      SEQ
+        dx := x2 - x1
+        dy := y2 - y1
+        -- Replace the divide-by-two in the following commented code with an
+        -- arithmetic shift left, nearly four times faster. Transputer does not
+        -- have this instruction natively, so we need to use several others.
+        -- Based on Transputer Assembler Language Programming, PDF page 39.
+        -- Original code: diff := (Hypot (dx, dy) - kUnit) / 2
+        diff := Hypot (dx, dy) - kUnit
+        ASM
+          LD diff  -- Load diff into A.     2 cycles, assuming LDL.
+          XDBLE    -- Sign-extend A into B. 2 cycles.
+          LDC 1    -- Push 1.               1 cycle.
+          LSHR     -- Long shift right.     4 cycles.
+          ST diff  -- Store A into diff.    1 cycle, assuming LDL. TOTAL: 10.
+      RESULT FastMul (dx, diff), FastMul (dy, diff)
+  :
+  -- }}}
+
+  -- {{{ResolveRowXOnly -- apply constraints between horizontal neighbours only
+  --
+  -- Useful for the topmost row of the flag, where no neighbours are above
+  -- Note: It's OK to inline this procedure since it's only used in one spot
+  --
+  -- Args:
+  --   row.x, row.y: X and Y coordinates of elements in the row
+  INLINE PROC ResolveRowXOnly ([]INT row.x, row.y)
+    INT dx, dy :
+    SEQ c = 1 FOR COLUMNS - 1
+      VAL b IS c - 1 :  -- B comes just before C...
+      SEQ
+        dx, dy := ConstraintDelta(row.x[c], row.y[c], row.x[b], row.y[b])
+        SEQ
+          row.x[b] := row.x[b] + dx
+          row.y[b] := row.y[b] + dy
+          row.x[c] := row.x[c] - dx
+          row.y[c] := row.y[c] - dy
+  :
+  -- }}}
+
+  -- {{{ResolveRow -- apply constraints between horiz. and vert. neighbours
+  --
+  -- Useful for a pair of neighbouring rows that are handled by the same worker
+  -- Note: It's OK to inline this procedure since it's only used in one spot
+  --
+  -- Args:
+  --   row.x, row.y: X and Y coordinates of elements in a row -- these elements
+  --       wil be adjusted to satisfy "horizontal" constraints among themselves
+  --       and "vertical" constraints against their neighbours in the next row
+  --       above
+  --   row.up.x, row.up.y: X and Y coordinates of elements in "the next row
+  --       above" -- these elements will only be adjusted to satisfy "vertical"
+  --       constraints against their neighbours in the row below
+  INLINE PROC ResolveRow ([]INT row.x, row.y, row.up.x, row.up.y)
+    INT dx, dy :
+    SEQ c = 0 FOR COLUMNS
+      SEQ
+        -- {{{Nudge the link between this element and its neighbour to the left
+        IF
+          c = 0  -- We can't resolve between columns -1 and 0...
+            SKIP
+          TRUE
+            VAL b IS c - 1 :  -- B comes just before C...
+            SEQ
+              dx, dy := ConstraintDelta(row.x[c], row.y[c], row.x[b], row.y[b])
+              SEQ
+                row.x[b] := row.x[b] + dx
+                row.y[b] := row.y[b] + dy
+                row.x[c] := row.x[c] - dx
+                row.y[c] := row.y[c] - dy
+        -- }}}
+        -- {{{Nudge the link between this element and its neighbour above
+        dx, dy := ConstraintDelta(row.x[c], row.y[c], row.up.x[c], row.up.y[c])
+        PAR
+          row.up.x[c] := row.up.x[c] + dx
+          row.up.y[c] := row.up.y[c] + dy
+          row.x[c] := row.x[c] - dx
+          row.y[c] := row.y[c] - dy
+        -- }}}
+  :
+  -- }}}
+
+  -- {{{ResolveDown -- Ask the worker below us to resolve elements in a row
+  --
+  -- One half of the way we apply constraints between neighbouring rows that
+  -- are handled by neighbouring workers: the upper-row worker sends each of
+  -- its elements' locations down to the worker below and receives corrected
+  -- locations for those elements; see ResolveUp below
+  --
+  -- Args:
+  --   row.x, row.y: X and Y coordinates of elements in the row whose
+  --       neighbours below are handled by the next worker down in the chain
+  PROC ResolveDown ([]INT row.x, row.y)
+    SEQ c = 0 FOR COLUMNS
+      SEQ
+        -- Send out the location of the c'th element on the row
+        to.down ! row.x[c]  -- Send X value
+        to.down ! row.y[c]  -- Send Y value
+        -- Receive the corrected location of that element
+        from.down ? row.x[c]  -- Get X value
+        from.down ? row.y[c]  -- Get Y value
+  :
+  -- }}}
+
+  -- {{{ResolveUp -- Resolve a row pair shared with the worker above us
+  --
+  -- The other half of the way we apply constraints between neighbouring rows
+  -- that are handled by neighbouring workers: this worker receives locations
+  -- of elements in the row just above the argument row down from the next
+  -- worker up on the chain, then it sends corrected locations for those
+  -- elements back up. Calculations are identical to those in ResolveRow
+  --
+  -- Args:
+  --   row.x, row.y: X and Y coordinates of elements in the row whose
+  --       neighbours above are handled by the next worker up in the chain
+  PROC ResolveUp ([]INT row.x, row.y)
+    INT up.x, up.y, dx, dy :
+    SEQ c = 0 FOR COLUMNS
+      SEQ
+        -- {{{X resolution happens locally, in a manner identical to ResolveRow
+        IF
+          c = 0  -- We can't resolve between columns -1 and 0...
+            SKIP
+          TRUE
+            VAL b IS c - 1 :  -- B comes just before C...
+            SEQ
+              dx, dy := ConstraintDelta(row.x[c], row.y[c], row.x[b], row.y[b])
+              SEQ
+                row.x[b] := row.x[b] + dx
+                row.y[b] := row.y[b] + dy
+                row.x[c] := row.x[c] - dx
+                row.y[c] := row.y[c] - dy
+        -- }}}
+        -- {{{Y resolution by contrast crosses the link to the worker above us
+        from.up ? up.x
+        from.up ? up.y
+        dx, dy := ConstraintDelta(row.x[c], row.y[c], up.x, up.y)
+        PAR
+          SEQ
+            to.up ! up.x + dx
+            to.up ! up.y + dy
+          SEQ
+            row.x[c] := row.x[c] - dx
+            row.y[c] := row.y[c] - dy
+        -- }}}
+  :
+  -- }}}
+
+  -- {{{Resolve -- apply one iteration of the resolution procedure
+  --
+  -- This procedure combines all of the steps just described above, applying
+  -- constraints row-by-row, top to bottom, at all of the rows handled by this
+  -- worker
+  --
+  -- Args:
+  --   none
+  PROC Resolve ()
+    SEQ
+      -- {{{For the topmost row on this worker
+      -- If there is a worker above us, apply constraints to the links between
+      -- its bottom row and our top row; otherwise, apply horizontal
+      -- constraints to the top row only
+      []INT row.x IS [flag.x FROM 0 FOR COLUMNS] :
+      []INT row.y IS [flag.y FROM 0 FOR COLUMNS] :
+      IF
+        ROWS.ABOVE > 0
+          ResolveUp (row.x, row.y)
+        TRUE  -- ROWS.ABOVE <= 0
+          ResolveRowXOnly (row.x, row.y)
+      -- }}}
+
+      -- {{{For all rows but the topmost row on this worker
+      -- Apply vertical constraints to all pairs of adjacent rows, and
+      -- horizontal constraints to the lower row of each pair
+      SEQ r = 1 FOR ROWS - 1
+        VAL r.times.cols IS r TIMES COLUMNS :
+        VAL r.minus.1.times.cols IS (r - 1) TIMES COLUMNS :
+        []INT row.x IS [flag.x FROM r.times.cols FOR COLUMNS] :
+        []INT row.y IS [flag.y FROM r.times.cols FOR COLUMNS] :
+        []INT row.up.x IS [flag.x FROM r.minus.1.times.cols FOR COLUMNS] :
+        []INT row.up.y IS [flag.y FROM r.minus.1.times.cols FOR COLUMNS] :
+        SEQ
+          ResolveRow (row.x, row.y, row.up.x, row.up.y)
+      -- }}}
+
+      -- {{{An extra step for the bottommost row on this worker
+      -- If there is a worker below us, apply constraints to the links between
+      -- its top row and our bottom row.
+      IF
+        BOTTOM
+          SKIP
+        TRUE
+          VAL r.minus.1.times.cols IS (ROWS - 1) TIMES COLUMNS :
+          []INT row.x IS [flag.x FROM r.minus.1.times.cols FOR COLUMNS] :
+          []INT row.y IS [flag.y FROM r.minus.1.times.cols FOR COLUMNS] :
+          ResolveDown (row.x, row.y)
+      -- }}}
+  :
+  -- }}}
+  -- }}}
+
+
+  -- {{{Transmit -- transform and collectively export flag data
+  --
+  -- Row element locations are transformed into CGA 320x200 screen coordinates
+  -- and passed along to the worker below in reverse order, from bottom to top,
+  -- as this allows for a modest amount of pipelining amongst the workers: as
+  -- soon as the top worker has finished sending its data, it can begin
+  -- computing new flag locations. It isn't perfect: a worker at one level will
+  -- be stalled until the worker beneath it has transmitted *all* of its
+  -- transformed elements. Some buffering would alleviate this, but RAM is
+  -- scarce on TRAMs that have only 32K of memory, for example.
+  --
+  -- As noted elsewhere, the transformation into CGA screen coordinates also
+  -- rotates the flag 90 degrees anticlockwise, giving it the look of a flag
+  -- flying in a fresh breeze instead of draping downward from a horizontal rod
+  --
+  -- Element locations are transmitted as x, y pairs of ints, and if an element
+  -- should not be displayed (e.g. because it has moved outside of the window
+  -- that the CGA monitor uses to view the flag), then x and y values are sent
+  -- as -1 and -1 respectively
+  --
+  -- From the perspective of the flag boss: CGA screen coordinates for each
+  -- flag element are transmitted as x, y pairs, iterating in "reverse
+  -- row-major order": through each column from left to right, in each row from
+  -- BOTTOM to TOP (note reverse order!)
+  --
+  -- Args:
+  --   none
+  PROC Transmit ()
+    INT item :
+    SEQ
+      -- {{{Transform and send our data
+      -- First, send our own flag data. We transform it into display coords
+      -- on our CGA display, rotating it 90 degrees anticlockwise so that it
+      -- appears to be flapping in a breeze coming from the left. We send from
+      -- the bottom row to the top row so that some pipelining can take place.
+      SEQ r.rev = 1 FOR ROWS  -- Note going through rows backwards!
+        VAL r IS ROWS - r.rev :
+        []INT row.x IS [flag.x FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.y IS [flag.y FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        INT cga.x, cga.y :
+        SEQ c = 0 FOR COLUMNS
+          SEQ
+            -- Convert flag element positions into CGA screen locations
+            cga.x := (((TO.CGA.X.MUL TIMES row.y[c]) / TO.CGA.DIV) +
+                      TO.CGA.X.OFFSET)
+            cga.y := (((TO.CGA.Y.MUL TIMES row.x[c]) / TO.CGA.DIV) +
+                      TO.CGA.Y.OFFSET)
+            IF  -- Is the element actually visible on screen?
+              (cga.x < 0) OR (cga.x >= 320) OR (cga.y < 0) OR (cga.y >= 200)
+                SEQ
+                  to.down ! -1  -- If the point is not on the display, then...
+                  to.down ! -1  -- ...send -1, -1 so we know not to draw it.
+              TRUE  -- Coordinates are actually visible on the display
+                SEQ
+                  to.down ! cga.x  -- Send X value in CGA coordinates
+                  to.down ! cga.y  -- Send Y value in CGA coordinates
+      -- }}}
+      -- {{{Pass along all data from workers above us
+      -- Now await the worker above us to send us flag data from itself and
+      -- workers above it. Recall that if no workers are above, ROWS.ABOVE = 0.
+      -- Then just transmit that data on downward.
+      SEQ r = 0 FOR ROWS.ABOVE
+        SEQ c = 0 FOR COLUMNS
+          SEQ
+            from.up ? item  -- Get X value in CGA coordinates
+            to.down ! item  -- Send X value in CGA coordinates
+            from.up ? item  -- Get Y value in CGA coordinates
+            to.down ! item  -- Send Y value in CGA coordinates
+      -- }}}
+  :
+  -- }}}
+
+
+  -- {{{Flag -- flag element initialisation and main simulation loop
+  --
+  -- Across all of the workers, flag elements are initialised to lie in a
+  -- grid with spacing of 1.0 between adjacent elements. The flag starts out
+  -- hanging motionless from the X axis (so all X values are non-negative),
+  -- just to the right of the Y axis (so all Y values are non-positive)
+  --
+  -- This procedure never terminates
+  --
+  -- Args:
+  --   none
+  PROC Flag ()
+    SEQ
+      -- The clock starts at 0
+      time := 0
+
+      -- {{{Initialise the flag's state as described above
+      SEQ r = 0 FOR ROWS
+        []INT row.x IS [flag.x FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.y IS [flag.y FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.prev.x IS [flag.prev.x FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        []INT row.prev.y IS [flag.prev.y FROM (r TIMES COLUMNS) FOR COLUMNS] :
+        SEQ
+          SEQ c = 0 FOR COLUMNS
+            row.x[c], row.y[c] := Fix (c), Fix (-(ROWS.ABOVE + r))
+          row.prev.x := row.x
+          row.prev.y := row.y
+      -- }}}
+      -- {{{Flag simulation loop
+      WHILE TRUE
+        SEQ
+          SEQ i = 0 FOR kAccuracy
+            Resolve ()
+          Update ()
+          PAR
+            Transmit ()
+            time := time + kDt
+      -- }}}
+  :
+  -- }}}
+
+
+  -- "Main program": together with other workers, configure, then simulate
+  SEQ
+    Config ()
+    Flag ()
+:
+-- }}}
