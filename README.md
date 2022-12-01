@@ -437,7 +437,7 @@ flags are more recognisable than others.
 How else does this flag fly?
 ----------------------------
 
-This flag flies in joyful appreciation of trans people everywhere!
+This simulated flag flies out of joyful esteem for trans people everywhere!
 
 
 Learning more: touring the code
