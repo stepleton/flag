@@ -486,12 +486,12 @@ generally well-thought-out language:
   the way you do nothing in a branch (similar to `pass` in python) is to say
   `SKIP`.
 
-* The VAL keyword declares an immutable alias to the result of an occam
+* The `VAL` keyword declares an immutable alias to the result of an occam
   expression. `VAL foo IS 2 + 2` binds 4 to `foo`. All parameters to procedures
   are assumed to be mutable (see [call by reference](
   https://en.wikipedia.org/wiki/Evaluation_strategy#Call_by_reference)) unless
-  they are preceded by VAL in the procedure definition, in which case they are
-  provided [by value](
+  they are preceded by `VAL` in the procedure definition, in which case they
+  are provided [by value](
   https://en.wikipedia.org/wiki/Evaluation_strategy#Call_by_value), at least
   from the programmer's point of view.
 
