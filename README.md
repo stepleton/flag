@@ -430,8 +430,9 @@ directly with the B008 card and copies data to video memory as quickly as
 possible. As the superior display option, the headless system earned additional
 features during development, particularly the ability to tell the flag boss to
 change the flag colour map to a different pattern. You can choose between ten
-different flags by pressing the number keys; thanks to CGA's limitations, some
-flags are more recognisable than others.
+different flags by pressing the number keys; thanks to CGA's limitations, which
+motivated certain practical choices about which flags to include, some flags
+are more recognisable than others.
 
 
 How else does this flag fly?
